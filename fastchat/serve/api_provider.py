@@ -3,6 +3,7 @@
 import json
 import os
 import random
+from typing import Optional
 import time
 
 import requests
@@ -79,6 +80,43 @@ def get_api_provider_stream_iter(
             temperature,
             top_p,
             max_new_tokens,
+            api_base=model_api_dict["api_base"],
+            api_key=model_api_dict["api_key"],
+        )
+    elif model_api_dict["api_type"] == "yandexgpt":
+        # note: top_p parameter is unused by yandexgpt
+
+        messages = []
+        if conv.system_message:
+            messages.append({"role": "system", "text": conv.system_message})
+        messages += [
+            {"role": role, "text": text}
+            for role, text in conv.messages
+            if text is not None
+        ]
+
+        fixed_temperature = model_api_dict.get("fixed_temperature")
+        if fixed_temperature is not None:
+            temperature = fixed_temperature
+
+        stream_iter = yandexgpt_api_stream_iter(
+            model_name=model_api_dict["model_name"],
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_new_tokens,
+            api_base=model_api_dict["api_base"],
+            api_key=model_api_dict.get("api_key"),
+            folder_id=model_api_dict.get("folder_id"),
+        )
+    elif model_api_dict["api_type"] == "cohere":
+        messages = conv.to_openai_api_messages()
+        stream_iter = cohere_api_stream_iter(
+            client_name=model_api_dict.get("client_name", "FastChat"),
+            model_id=model_api_dict["model_name"],
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
             api_base=model_api_dict["api_base"],
             api_key=model_api_dict["api_key"],
         )
@@ -452,3 +490,113 @@ def nvidia_api_stream_iter(model_name, messages, temp, top_p, max_tokens, api_ba
             data = json.loads(data[6:])["choices"][0]["delta"]["content"]
             text += data
             yield {"text": text, "error_code": 0}
+
+
+def yandexgpt_api_stream_iter(
+    model_name, messages, temperature, max_tokens, api_base, api_key, folder_id
+):
+    api_key = api_key or os.environ["YANDEXGPT_API_KEY"]
+    headers = {
+        "Authorization": f"Api-Key {api_key}",
+        "content-type": "application/json",
+    }
+
+    payload = {
+        "modelUri": f"gpt://{folder_id}/{model_name}",
+        "completionOptions": {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        },
+        "messages": messages,
+    }
+    logger.info(f"==== request ====\n{payload}")
+
+    # https://llm.api.cloud.yandex.net/foundationModels/v1/completion
+    response = requests.post(
+        api_base, headers=headers, json=payload, stream=True, timeout=60
+    )
+    text = ""
+    for line in response.iter_lines():
+        if line:
+            data = json.loads(line.decode("utf-8"))
+            data = data["result"]
+            top_alternative = data["alternatives"][0]
+            text = top_alternative["message"]["text"]
+            yield {"text": text, "error_code": 0}
+
+            status = top_alternative["status"]
+            if status in (
+                "ALTERNATIVE_STATUS_FINAL",
+                "ALTERNATIVE_STATUS_TRUNCATED_FINAL",
+            ):
+                break
+
+
+def cohere_api_stream_iter(
+    client_name: str,
+    model_id: str,
+    messages: list,
+    temperature: Optional[
+        float
+    ] = None,  # The SDK or API handles None for all parameters following
+    top_p: Optional[float] = None,
+    max_new_tokens: Optional[int] = None,
+    api_key: Optional[str] = None,  # default is env var CO_API_KEY
+    api_base: Optional[str] = None,
+):
+    import cohere
+
+    OPENAI_TO_COHERE_ROLE_MAP = {
+        "user": "User",
+        "assistant": "Chatbot",
+        "system": "System",
+    }
+
+    client = cohere.Client(
+        api_key=api_key,
+        base_url=api_base,
+        client_name=client_name,
+    )
+
+    # prepare and log requests
+    chat_history = [
+        dict(
+            role=OPENAI_TO_COHERE_ROLE_MAP[message["role"]], message=message["content"]
+        )
+        for message in messages[:-1]
+    ]
+    actual_prompt = messages[-1]["content"]
+
+    gen_params = {
+        "model": model_id,
+        "messages": messages,
+        "chat_history": chat_history,
+        "prompt": actual_prompt,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_new_tokens": max_new_tokens,
+    }
+    logger.info(f"==== request ====\n{gen_params}")
+
+    # make request and stream response
+    res = client.chat_stream(
+        message=actual_prompt,
+        chat_history=chat_history,
+        model=model_id,
+        temperature=temperature,
+        max_tokens=max_new_tokens,
+        p=top_p,
+    )
+    try:
+        text = ""
+        for streaming_item in res:
+            if streaming_item.event_type == "text-generation":
+                text += streaming_item.text
+                yield {"text": text, "error_code": 0}
+    except cohere.core.ApiError as e:
+        logger.error(f"==== error from cohere api: {e} ====")
+        yield {
+            "text": f"**API REQUEST ERROR** Reason: {e}",
+            "error_code": 1,
+        }
